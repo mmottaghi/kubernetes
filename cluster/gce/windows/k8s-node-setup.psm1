@@ -442,6 +442,17 @@ function DownloadAndInstall-CSIProxyBinaries {
   }
 }
 
+function Schedule-Reboot {
+  param (
+    [parameter(Mandatory=$true)] [string]$requestor
+  )
+  $env:LastRebootRequestor = $requestor
+}
+
+function IsRequired-Reboot {
+  return -not [string]::IsNullOrEmpty($env:LastRebootRequestor)
+}
+
 # Downloads Network Policy related binaries, install and configure them.
 # kube-env WINDOWS_NETWORK_POLICY_PROVIDER determines what plugin to be
 # downloaded, installed and configured.
@@ -450,57 +461,49 @@ function DownloadAndInstall-CSIProxyBinaries {
 #   WINDOWS_NETWORK_POLICY_PROVIDER
 function DownloadInstallAndConfigure-NetworkPolicy {
   if ("${env:WINDOWS_NETWORK_POLICY_PROVIDER}" -eq "antrea") {
-    DownloadAndInstall-OVSBinaries
-    DownloadAndInstall-AntreaBinaries
-    DownloadAndInstall-AntreaScripts
-    Create-AntreaKubeconfig
-    Start-AntreaService
+	if (-not $(Test-Path -Path "${env:ANTREA_KUBECONFIG}")) {
+		DownloadAndInstall-OVSBinaries
+		if (IsRequired-Reboot) {
+			Log-Output "___Reboot Required"
+			return 
+		}
+		DownloadAndInstall-AntreaBinaries
+		DownloadAndInstall-AntreaScripts
+		Create-AntreaKubeconfig
+	}
   }
-}
-
-# Sets up antrea service.
-#
-# Required ${kube_env} keys:
-#   ANTREA_CONFIG
-function Start-AntreaService {
-  Configure-Antrea
-
-  $env:NODE_NAME = (hostname)
-  $antrea_args = @(`
-    "--log_file=\etc\kubernetes\logs\antrea.log",
-    "--logtostderr=false"
-  )
-
-  Log-Output "kubelet_args from metadata: ${kubelet_args}"
-  & sc.exe create antrea-agent binPath= "${env:NODE_DIR}\antrea-agent.exe --config ${env:ANTREA_CONFIG} ${antrea_args}" start= demand
-  & sc.exe failure antrea-agent reset= 0 actions= restart/10000
-  & sc.exe start antrea-agent
+  Log-Output "___Done with configuring network policy for ${env:WINDOWS_NETWORK_POLICY_PROVIDER}"
 }
 
 # Download and install ovs binaries. kube-env OVS_INSTALLER_URL specifies the
-# url to a script that downloads and installs OVS. It also enabled Hyper-V, which
-# is prerequisite for OVS.
+# url to a script that downloads and installs OVS. It also enables Hyper-V, which
+# is a prerequisite for OVS.
 #
 # Required ${kube_env} keys:
 #   OVS_INSTALLER_URL
 function DownloadAndInstall-OVSBinaries {
-  Log-Output "Enabling HyperV"
-  Install-WindowsFeature containers
-  Install-WindowsFeature Hyper-V-Powershell
-  dism /online /enable-feature /featurename:Microsoft-Hyper-V /all /NoRestart
-  dism /online /disable-feature /featurename:Microsoft-Hyper-V-Online /NoRestart
+  $ovs_installer = 'C:\k8s_tmp\Install-OVS.ps1'
+  if (Test-Path -Path $ovs_installer) { # Install-OVS.ps1 was not found locally
+	  if (Test-Path -Path 'c:\openvswitch\usr\bin\ovs-appctl.exe') {
+		Log-Output "___Skipping OVS step; found: ovs-appctl.exe"
+	  } else {
+		Log-Output "___Installing OVS"
+		& $ovs_installer
+		Log-Output "___Installation finished"
+	  }
+  } else {
+	  Log-Output "___Enabling HyperV"
+	  Install-WindowsFeature containers
+	  Install-WindowsFeature Hyper-V-Powershell
+	  dism /online /enable-feature /featurename:Microsoft-Hyper-V /all /NoRestart
+	  dism /online /disable-feature /featurename:Microsoft-Hyper-V-Online /NoRestart
 
-  Log-Output "Installing OVS"
-  $ovsInstallerURL = ${env:OVS_INSTALLER_URL}
-
-  # Download ovs installer
-  $tmp_dir = 'C:\k8s_tmp'
-  New-Item -Force -ItemType 'directory' $tmp_dir | Out-Null
-  $filename = 'Install-OVS.ps1'
-  MustDownload-File -OutFile $tmp_dir\$filename -URLs $ovsInstallerURL
-
-  # Install OVS
-  & $tmp_dir\$filename
+	  Log-Output "___Downloading OVS Installer"
+	  New-Item -Force -ItemType 'directory' $(Split-Path -Path $ovs_installer) | Out-Null
+	  MustDownload-File -OutFile $ovs_installer -URLs $env:OVS_INSTALLER_URL
+	  Bcdedit.exe -set TESTSIGNING ON
+	  Schedule-Reboot('hyper-v activation')
+  }
 }
 
 # Download and install antrea binaries: antrea-agent and antrea-cni. kube-env
@@ -511,27 +514,21 @@ function DownloadAndInstall-OVSBinaries {
 #   ANTREA_AGENT_BINARY_URL
 #   ANTREA_CNI_BINARY_URL
 function DownloadAndInstall-AntreaBinaries {
-  $agent_url = ${env:ANTREA_AGENT_BINARY_URL}
-  $cni_url = ${env:ANTREA_CNI_BINARY_URL}
-
-  # Download ovs installer
-  $tmp_dir = 'C:\k8s_tmp'
-  New-Item -Force -ItemType 'directory' $tmp_dir | Out-Null
-  $cni_filename = 'antrea.exe'
-  MustDownload-File -OutFile $tmp_dir\$cni_filename -URLs $cni_url
-  $agent_filename = 'antrea-agent.exe'
-  MustDownload-File -OutFile $tmp_dir\$agent_filename -URLs $agent_url
-
-  Move-Item -Force $tmp_dir\$cni_filename ${env:CNI_DIR}\$cni_filename
-  Move-Item -Force $tmp_dir\$agent_filename ${env:NODE_DIR}\$agent_filename
+  $cni = "${env:CNI_DIR}\antrea.exe"
+  if (Test-Path -Path $cni) {
+	  Log-Output "___Skipping step; Antrea binaries found at: $cni"
+  } else {
+	  Log-Output "___Downloading Antrea binaries"
+	  MustDownload-File -OutFile $cni                               -URLs ${env:ANTREA_CNI_BINARY_URL}
+	  MustDownload-File -OutFile "${env:NODE_DIR}\antrea-agent.exe" -URLs ${env:ANTREA_AGENT_BINARY_URL}
+  }
 }
 
 # Install Antrea's prepare script and install the trigger to run the script at
 # startup time
 function DownloadAndInstall-AntreaScripts {
-  $filename = 'C:\Prepare-AntreaAgent.ps1'
-
-  Set-Content $filename `
+  $prepareAgrent = 'C:\Prepare-AntreaAgent.ps1'
+  Set-Content $prepareAgrent `
 '$NeedCleanNetwork = $true
 $AntreaHnsNetwork = Get-HnsNetwork | Where-Object {$_.Name -eq "antrea-hnsnetwork"}
 if ($AntreaHnsNetwork) {
@@ -566,8 +563,8 @@ Set-NetIPInterface -ifAlias $INTERFACE_TO_ADD_SERVICE_IP -Forwarding Enabled
 Stop-Service kube-proxy
 Start-Service kube-proxy
 '
-
-  & $filename
+  Log-Output "___Preparing Antrea agent"
+  & $prepareAgrent
 
   # TODO(anfernee): Schedule at startup
   # It failed with:
@@ -576,6 +573,28 @@ Start-Service kube-proxy
   # $trigger = New-JobTrigger -AtStartup
   # $options = New-ScheduledJobOption -RunElevated
   # Register-ScheduledJob -Name PrepareAntreaAgent -Trigger $trigger -ScriptBlock { Invoke-Expression C:\Prepare-AntreaAgent.ps1 } -ScheduledJobOption $options
+}
+
+# Sets up antrea service.
+#
+# Required ${kube_env} keys:
+#   ANTREA_CONFIG
+function Start-AntreaService {
+  # Start Antrea Service
+  if (Test-Path -Path ${env:ANTREA_KUBECONFIG}) {
+	  $env:NODE_NAME = (hostname)
+	  $antrea_args = @(`
+		"--log_file=\etc\kubernetes\logs\antrea.log",
+		"--logtostderr=false"
+	  )
+	  $antr_cmd = "${env:NODE_DIR}\antrea-agent.exe --config ${env:ANTREA_CONFIG} ${antrea_args}"
+	  
+	  Log-Output "___Starting Antrea Service [node=${env:NODE_NAME}]: $antr_cmd"
+	  Configure-Antrea	  
+	  & sc.exe create antrea-agent binPath="$antr_cmd"  start= demand
+	  & sc.exe failure antrea-agent reset= 0 actions= restart/10000
+	  & sc.exe start antrea-agent
+  }  
 }
 
 function Start-CSIProxy {

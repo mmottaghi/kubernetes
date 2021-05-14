@@ -104,6 +104,7 @@ function IsLoggingEnabled {
 }
 
 try {
+  $env:LastRebootRequestor = ''
   # Don't use FetchAndImport-ModuleFromMetadata for common.psm1 - the common
   # module includes variables and functions that any other function may depend
   # on.
@@ -192,6 +193,10 @@ try {
   Pull-InfraContainer
   # Flush cache to disk to persist the setup status
   Write-Volumecache C -PassThru
+  if (-not [string]::IsNullOrEmpty($env:LastRebootRequestor)) {
+	Write-Host "Reboot requested by: $env:LastRebootRequestor"
+	Restart-Computer
+  }
 }
 catch {
   Write-Host 'Exception caught in script:'
